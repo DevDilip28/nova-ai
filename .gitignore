@@ -1,0 +1,49 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.aws/
+.ssh/
+*.pem
+*.key
+*.p12
+*.pfx
+credentials
+credentials.*
+*.credentials
+credentials.json
+secrets.json
+*.secret
+*.secrets
+*.token
+id_rsa
+id_ed25519
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# JavaScript dependencies and build output
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Local runtime data and generated user projects
+data/
+generated_projects/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite*
+
+# Local logs and coverage output
+*.log
+.coverage
+htmlcov/
