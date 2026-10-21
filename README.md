@@ -4,7 +4,7 @@
 
 NOVA is a local, voice-first AI assistant demo. It answers questions, researches the web with linked sources, and creates small React/Vite or FastAPI starter applications. The web UI is built with React, TypeScript, and Vite; a Python FastAPI service provides chat, task, project, and approval APIs; and an MCP server exposes NOVA tools over Streamable HTTP.
 
-NOVA is an independent project. It is **not** an official Alexa+ integration, does not connect to Amazon's private Alexa+ preview, and has no wake-word detection. The microphone starts only when the user presses the button. Alexa+ track eligibility depends on successfully running and demonstrating the MCP server against the required protocol; see [the demo checklist](docs/demo-checklist.md).
+NOVA is an independent project. It is **not** an official Alexa+ integration, does not connect to Amazon's private Alexa+ preview, and has no wake-word detection. The microphone starts only when the user presses the button. Alexa+ track eligibility depends on successfully running and demonstrating the MCP server against the required protocol.
 
 ## Features
 
