@@ -36,6 +36,7 @@ class FileWrite(BaseModel):
 
 class CommandRequest(BaseModel):
     command: str
+    approved: bool = False
 
 @app.get("/api/health")
 def health():
@@ -99,30 +100,41 @@ async def approve(approval_id: str, body: ApprovalRequest):
         result = task_obj["result"] | {"answer":answer}
         store.update_task(item["task_id"], status="completed", result=result, event="Approval declined; generated project retained")
         return {"status":"rejected"}
-    if not item["details"].get("project_id") or item["action"] not in {"npm install", "npm run build", "pip install -r requirements.txt"}:
+    project_id = item["details"].get("project_id")
+    project_info = store.get_project(project_id) if project_id else None
+    allowed = {"react-vite": {"npm install", "npm run build", "npm run dev"}, "fastapi": {"pip install -r requirements.txt", "python -m compileall -q .", "python -m uvicorn main:app --reload"}}
+    if not project_info or item["action"] not in allowed.get(project_info["stack"], set()):
         answer = "This action is not available through NOVA's supported project tools. No external action was taken."
         result = task_obj["result"] | {"answer":answer,"error":"No connected execution tool supports this approved action."}
         store.update_task(item["task_id"], status="waiting_for_user", result=result, event="Approval recorded; action is outside supported project operations")
         return {"status":"blocked","message":answer}
     try:
-        project_id = item["details"]["project_id"]
-        project_info = store.get_project(project_id)
-        if not project_info: raise ValueError("The approved project is no longer available.")
+        store.update_task(item["task_id"], status="running", event=f"Running approved action: {item['action']}")
+        if item["action"] in {"npm run dev", "python -m uvicorn main:app --reload"}:
+            result = await asyncio.to_thread(projects.start_server, project_id, True)
+            if result["status"] != "running" or not result.get("url"):
+                raise ValueError("The server did not report a ready local URL before the startup timeout. " + "\n".join(result.get("output", [])[-10:]))
+            final = task_obj["result"] | {"answer":f"Application running at {result['url']}", "server":result}
+            store.update_task(item["task_id"], status="completed", result=final, event="Managed development server is running")
+            return {"status":"completed","result":result}
         if project_info["stack"] == "react-vite":
             result = await asyncio.to_thread(projects.run_command, project_id, item["action"], True)
-        else:
+        elif item["action"] == "pip install -r requirements.txt":
             result = await asyncio.to_thread(projects.setup_fastapi, project_id, True)
-        if result["exit_code"] != 0: raise ValueError("The approved project command failed. See the project directory and command output.")
-        if project_info["stack"] == "fastapi":
+        else:
+            result = await asyncio.to_thread(projects.run_command, project_id, item["action"], True)
+        if result["exit_code"] != 0:
+            raise ValueError(f"Approved command failed with exit code {result['exit_code']}.\n{result.get('stderr', '')[-4000:]}\n{result.get('stdout', '')[-4000:]}")
+        if item["action"] == "pip install -r requirements.txt":
             completion = "Dependencies installed in the project virtual environment. Start it with .venv\\Scripts\\python.exe -m uvicorn main:app --reload from the project directory."
         elif item["action"] == "npm install":
             completion = "Dependencies installed successfully. Start the app with npm run dev from the project directory."
         else:
             completion = "The project build command completed successfully."
         final = task_obj["result"] | {"answer":completion,"command_result":result}
-        store.update_task(item["task_id"], status="completed", result=final, event="Approved dependency installation completed")
+        store.update_task(item["task_id"], status="completed", result=final, event="Approved project action completed successfully")
         return {"status":"completed","result":result}
-    except ValueError as exc:
+    except Exception as exc:
         store.update_task(item["task_id"], status="failed", result=task_obj["result"] | {"error":str(exc)}, event="Approved setup could not be completed")
         raise HTTPException(400, str(exc))
 
@@ -151,14 +163,26 @@ def file_write(project_id: str, body: FileWrite):
 
 @app.post("/api/projects/{project_id}/commands")
 def command(project_id: str, body: CommandRequest):
-    if body.command.strip() in {"npm install", "npm run build"}:
-        project = store.get_project(project_id)
+    action = body.command.strip()
+    project = store.get_project(project_id)
+    if not project: raise HTTPException(404, "Project not found")
+    supported = {"react-vite": {"npm install", "npm run build", "npm run dev"}, "fastapi": {"pip install -r requirements.txt", "python -m compileall -q .", "python -m uvicorn main:app --reload"}}
+    if action in supported.get(project["stack"], set()):
         if not project: raise HTTPException(404, "Project not found")
         task_id, approval_id = uuid.uuid4().hex, uuid.uuid4().hex
-        store.create_task(task_id, "setup", "Install dependencies for " + project["name"], "waiting_for_approval")
-        store.update_task(task_id, result={"project_id":project_id}, event="Dependency installation is waiting for approval")
-        action = body.command.strip()
+        store.create_task(task_id, "setup", f"{action} for {project['name']}", "waiting_for_approval")
+        store.update_task(task_id, result={"project_id":project_id,"project":project,"approval":{"id":approval_id,"action":action}}, event=f"{action} is waiting for approval")
         store.create_approval(approval_id, task_id, action, {"project_id":project_id,"path":project["path"]})
         return {"status":"waiting_for_approval","task_id":task_id,"approval_id":approval_id,"action":action}
-    try: return projects.run_command(project_id, body.command)
+    try: return projects.run_command(project_id, action)
+    except ValueError as exc: raise HTTPException(400, str(exc))
+
+@app.get("/api/projects/{project_id}/server")
+def server_status(project_id: str):
+    try: return projects.server_status(project_id)
+    except ValueError as exc: raise HTTPException(400, str(exc))
+
+@app.delete("/api/projects/{project_id}/server")
+def server_stop(project_id: str):
+    try: return projects.stop_server(project_id)
     except ValueError as exc: raise HTTPException(400, str(exc))

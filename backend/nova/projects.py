@@ -2,10 +2,28 @@ import os
 import json
 import re
 import subprocess
+import sys
+import threading
+import time
 import uuid
 from pathlib import Path
 from .config import settings
 from . import store
+
+_processes = {}
+
+def _terminate_process_tree(process):
+    if process.poll() is not None: return
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"], capture_output=True, text=True, timeout=8, shell=False)
+            process.wait(timeout=3)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    process.terminate()
+    try: process.wait(timeout=5)
+    except subprocess.TimeoutExpired: process.kill()
 
 def safe_root(project_id):
     project = store.get_project(project_id)
@@ -67,30 +85,90 @@ def write_file(project_id, relative, content):
     target.parent.mkdir(parents=True, exist_ok=True); target.write_text(content, encoding="utf-8")
     return {"path": relative, "bytes": target.stat().st_size}
 
+def _output_text(value, limit=12000):
+    if isinstance(value, bytes): value = value.decode("utf-8", errors="replace")
+    return (value or "")[-limit:]
+
 def run_command(project_id, command, approved=False):
     project = store.get_project(project_id); root = safe_root(project_id)
     command = command.strip()
-    allowed = {"npm install", "npm run build", "npm run dev", "python -m uvicorn main:app --reload", "uvicorn main:app --reload"}
+    allowed = {"npm install", "npm run build"} if project["stack"] == "react-vite" else {"python -m compileall -q ."}
     if command not in allowed: raise ValueError("Command is not on NOVA's project command allowlist.")
-    if command in {"npm install", "npm run build"} and not approved: raise ValueError("This project command needs approval from the NOVA interface.")
-    if command.endswith("dev") or "--reload" in command:
-        raise ValueError("Long-running development servers must be started from your terminal using the project path.")
+    if not approved: raise ValueError("This project command needs approval from the NOVA interface.")
     executable, *args = command.split()
+    if os.name == "nt" and executable == "npm":
+        # npm.cmd is a batch file; invoke it through cmd.exe with only fixed allowlisted arguments.
+        args = ["/d", "/s", "/c", "npm.cmd " + " ".join(args)]
+        executable = "cmd.exe"
     timeout = settings.dependency_install_timeout_seconds if command == "npm install" else settings.command_timeout_seconds
     try:
         result = subprocess.run([executable, *args], cwd=root, capture_output=True, text=True, timeout=timeout, shell=False)
-    except subprocess.TimeoutExpired as exc: return {"exit_code": None, "stdout": (exc.stdout or "")[:12000], "stderr": "Command exceeded the configured time limit."}
-    return {"exit_code": result.returncode, "stdout": result.stdout[-12000:], "stderr": result.stderr[-12000:]}
+    except subprocess.TimeoutExpired as exc: return {"exit_code": None, "stdout": _output_text(exc.stdout), "stderr": _output_text(exc.stderr) or "Command exceeded the configured time limit."}
+    return {"exit_code": result.returncode, "stdout": _output_text(result.stdout), "stderr": _output_text(result.stderr)}
+
+def start_server(project_id, approved=False):
+    if not approved: raise ValueError("Starting a generated application needs approval from the NOVA interface.")
+    project = store.get_project(project_id)
+    root = safe_root(project_id)
+    existing = _processes.get(project_id)
+    if existing and existing["process"].poll() is None:
+        return {"status": "running", "url": existing["url"], "pid": existing["process"].pid}
+    if project["stack"] == "react-vite":
+        if not (root / "package.json").is_file(): raise ValueError("package.json is missing from the project.")
+        if not (root / "node_modules").is_dir(): raise ValueError("Project dependencies are not installed. Approve npm install first.")
+        command = ["npm", "run", "dev", "--", "--host", "127.0.0.1"]
+        if os.name == "nt": command = ["cmd.exe", "/d", "/s", "/c", "npm.cmd run dev -- --host 127.0.0.1"]
+    elif project["stack"] == "fastapi":
+        python = root / ".venv" / "Scripts" / "python.exe" if os.name == "nt" else root / ".venv" / "bin" / "python"
+        if not (root / "main.py").is_file(): raise ValueError("main.py is missing from the project.")
+        if not python.is_file(): raise ValueError("Project dependencies are not installed. Approve pip install first.")
+        command = [str(python), "-m", "uvicorn", "main:app", "--reload", "--host", "127.0.0.1"]
+    else:
+        raise ValueError("Unsupported project stack.")
+    process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, shell=False)
+    info = {"process": process, "url": None, "output": []}
+    _processes[project_id] = info
+    def read_output():
+        if process.stdout:
+            for line in process.stdout:
+                info["output"].append(line.rstrip())
+                match = re.search(r"https?://(?:127\.0\.0\.1|localhost):\d+", line)
+                if match and not info["url"]: info["url"] = match.group(0)
+    threading.Thread(target=read_output, daemon=True).start()
+    deadline = time.monotonic() + 10
+    while info["url"] is None and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if process.poll() is not None and not info["url"]:
+        raise ValueError("The development server exited before reporting a local URL: " + "\n".join(info["output"][-10:]))
+    if info["url"] is None:
+        _terminate_process_tree(process)
+        raise ValueError("The development server did not report a local URL within 10 seconds: " + "\n".join(info["output"][-10:]))
+    return {"status": "running" if info["url"] else "starting", "url": info["url"], "pid": process.pid, "output": info["output"][-20:]}
+
+def server_status(project_id):
+    safe_root(project_id)
+    info = _processes.get(project_id)
+    if not info: return {"status": "stopped", "url": None, "output": []}
+    process = info["process"]
+    status = "running" if process.poll() is None else "failed"
+    return {"status": status, "url": info["url"], "pid": process.pid, "exit_code": process.poll(), "output": info["output"][-100:]}
+
+def stop_server(project_id):
+    safe_root(project_id)
+    info = _processes.pop(project_id, None)
+    if not info or info["process"].poll() is not None: return {"status": "stopped"}
+    _terminate_process_tree(info["process"])
+    return {"status": "stopped"}
 
 def setup_fastapi(project_id, approved=False):
     if not approved: raise ValueError("Python dependency installation needs approval from the NOVA interface.")
     root = safe_root(project_id)
     try:
-        env = subprocess.run([os.environ.get("PYTHON", "python"), "-m", "venv", ".venv"], cwd=root, capture_output=True, text=True, timeout=settings.command_timeout_seconds, shell=False)
+        env = subprocess.run([sys.executable, "-m", "venv", ".venv"], cwd=root, capture_output=True, text=True, timeout=settings.command_timeout_seconds, shell=False)
         if env.returncode: return {"exit_code":env.returncode,"stdout":env.stdout[-12000:],"stderr":env.stderr[-12000:]}
         python = root / ".venv" / "Scripts" / "python.exe"
         if not python.is_file(): raise ValueError("Could not locate the project virtual environment's Python executable.")
         result = subprocess.run([str(python), "-m", "pip", "install", "-r", "requirements.txt"], cwd=root, capture_output=True, text=True, timeout=settings.dependency_install_timeout_seconds, shell=False)
         return {"exit_code":result.returncode,"stdout":result.stdout[-12000:],"stderr":result.stderr[-12000:]}
     except subprocess.TimeoutExpired as exc:
-        return {"exit_code":None,"stdout":(exc.stdout or "")[-12000:],"stderr":"Project setup exceeded the configured time limit."}
+        return {"exit_code":None,"stdout":_output_text(exc.stdout),"stderr":_output_text(exc.stderr) or "Project setup exceeded the configured time limit."}

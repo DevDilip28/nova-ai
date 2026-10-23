@@ -78,18 +78,16 @@ async def process(task_id, request, history):
             name_match = re.search(r"(?:create|build|make)\s+(?:me\s+)?(?:a\s+)?(.{3,70}?)(?:\s+using|\s+with|\s+app|\s+application|$)", request, re.I)
             name = (name_match.group(1) if name_match else "NOVA generated application").strip(" .")[:60]
             plan.insert(0, f"Generate a {stack} project named {name}")
+            if not ai_provider.configured:
+                raise ProviderError(ai_provider.configuration_error())
+            store.update_task(task_id, event=f"Generating application code with {ai_provider.name}")
+            allowed = ["main.py"] if stack == "fastapi" else ["src/App.tsx", "src/style.css"]
+            file_bundle = await generate_files("Implement the user's application request as working code files. Return only a JSON files object. Include only allowed paths. Produce complete code, not pseudocode; omit source comments; use existing dependencies only; preserve accessible responsive behavior; include useful empty and error states.", f"Application specification: {request}\nProject name: {name}\nStack: {stack}\nAllowed files: {json.dumps(allowed)}\nReturn complete file contents for every allowed file.", allowed, 5000)
             project = projects.create_project(name, request, stack)
-            customized = False
-            if ai_provider.configured:
-                store.update_task(task_id, event=f"Generating application code with {ai_provider.name}")
-                allowed = ["main.py"] if stack == "fastapi" else ["src/App.tsx", "src/style.css"]
-                file_bundle = await generate_files("Implement the user's application request as working code files. Return only a JSON files object. Include only allowed paths. Produce complete code, not pseudocode; omit source comments; use existing dependencies only; preserve accessible responsive behavior; include useful empty and error states.", f"Application specification: {request}\nProject name: {name}\nStack: {stack}\nAllowed files: {json.dumps(allowed)}\nReturn complete file contents for every allowed file.", allowed, 5000)
-                for path, content in file_bundle.items(): projects.write_file(project["id"], path, content)
-                customized = True
+            for path, content in file_bundle.items(): projects.write_file(project["id"], path, content)
             approval_id = uuid.uuid4().hex
             store.create_approval(approval_id, task_id, "npm install" if stack == "react-vite" else "pip install -r requirements.txt", {"project_id":project["id"],"path":project["path"]})
-            detail = f"Application source was generated from your request with {ai_provider.name}." if customized else f"A working starter template was created. Configure {ai_provider.name} for request-specific generated code."
-            result = {"kind":kind,"plan":plan,"project":project,"approval":{"id":approval_id,"action":"Install project dependencies"},"answer":f"Created {name} with {len(project['files'])} actual project files at {project['path']}. {detail} Review the files, then approve dependency installation. Start it from a terminal when ready."}
+            result = {"kind":kind,"plan":plan,"project":project,"approval":{"id":approval_id,"action":"Install project dependencies"},"answer":f"Generated application source with {ai_provider.name} and created {len(project['files'])} project files at {project['path']}. Review the files, then approve dependency installation before building or running the app."}
             store.update_task(task_id, status="waiting_for_approval", result=result, event="Project files created; dependency installation is waiting for your approval")
             store.save_message(uuid.uuid4().hex, "assistant", result["answer"], {"task_id":task_id})
             return
@@ -102,5 +100,4 @@ async def process(task_id, request, history):
         store.update_task(task_id, status="failed", result=failed, event="A required external provider is unavailable")
         store.save_message(uuid.uuid4().hex, "assistant", str(exc), {"task_id":task_id,"error":True})
     except Exception as exc:
-        store.update_task(task_id, status="failed", result={"kind":kind,"error":"NOVA could not complete this operation. Check service configuration and try again."}, event="Task stopped after an internal operation error")
-
+        store.update_task(task_id, status="failed", result={"kind":kind,"error":str(exc) or "NOVA could not complete this operation. Check service configuration and try again."}, event="Task stopped after an internal operation error")
